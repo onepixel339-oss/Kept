@@ -1,0 +1,385 @@
+// Kept — Memory Core (Phase 2)
+//
+// Models: users, memories, memory_versions, entities, memory_entities,
+// relations, sources. Table and column names are mapped to snake_case
+// to match the documented data model (docs/memory-system.md) and to
+// make the future PostgreSQL migration a provider switch, not a
+// redesign.
+//
+// Portability rules (binding):
+//   - Enum-like fields are plain strings, validated at the application
+//     boundary against the canonical constants in `src/types/*`.
+//     The database stores; the application decides.
+//   - `relations` is intentionally polymorphic (source/target may be a
+//     memory or an entity), so its endpoints carry no foreign keys —
+//     existence and ownership are enforced in the application layer.
+//   - `sources.metadata` is a JSON string here (Prisma does not support
+//     the Json type on SQLite); the repository serializes and it maps
+//     to Json on PostgreSQL.
+//
+// Phase 3 adds the intelligence layer: processing state on memories and
+// the memory_analyses provenance table. Phase 4 adds chat_messages —
+// the Ask experience's persistence (the user's questions, and honest
+// assistant context records). Everything here remains
+// PostgreSQL-portable; every change is additive — no destructive
+// migration was run or needed.
+//
+// The AI still never writes here. `memory_analyses` stores validated
+// proposals and decisions made by APPLICATION logic; the AI only
+// proposes (see docs/architecture.md §2.1).
+//
+// Phase 7 adds real accounts: `password_hash` on users (null for
+// legacy anonymous rows — those are development data, never silently
+// attached to an account), plus `sessions` and
+// `password_reset_tokens`. Sessions store ONLY the SHA-256 hash of
+// the session token, so a database leak yields no usable credentials.
+// Every change is additive — no destructive migration.
+//
+// Phase 8 adds `memory_embeddings` — real vector persistence behind
+// the embedding repository seam (lib/ai). Rows exist ONLY for vectors
+// a real embedding provider produced (never fabricated); the identity
+// (memory_id, model, version) makes retries and reprocessing
+// idempotent. The vector is a little-endian Float32 BLOB here; the
+// PostgreSQL/pgvector migration turns this same table into the vector
+// table — no second database, no redesign.
+//
+// Phase 9 (rich input) extends `sources` additively — extraction status
+// (distinct from memory lifecycle), a storage key for the preserved
+// original, and a stable dedup key for idempotent retries — and adds
+// `memory_sources`: the many-to-many provenance join. One memory may
+// come from several sources (a screenshot + the user's caption), and a
+// source may in principle back more than one memory; deletion removes
+// a source only when nothing references it anymore. No destructive
+// migration; every existing row keeps its meaning (user_input sources
+// are "ready" — the user's words need no extraction).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// PRODUCTION DATASOURCE — PostgreSQL (Supabase).
+// The schema was written PG-portable from Phase 2 (snake_case @@map,
+// enum-like plain strings, JSON-as-String fields); switching providers
+// is a configuration change, not a redesign.
+//  - DATABASE_URL   → runtime connection (Supabase Transaction Pooler
+//                     :6543 — safe for serverless connection counts).
+//  - DIRECT_URL     → migration/schema connection (Supabase Direct
+//                     :5432). Not used at runtime; required by the
+//                     datasource for future prisma migrate workflows.
+// JSON-serialized String fields (sources.metadata, memory_analyses.*_json,
+// chat_messages.context_json) and memory_embeddings.vector (Bytes →
+// bytea, little-endian Float32) keep their application-level encoding
+// unchanged on PostgreSQL.
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// The owner of this personal memory space. A real account carries an
+// email and a scrypt password hash; legacy anonymous rows (created
+// before Phase 7) have neither — they remain development data and are
+// never silently attached to an account (explicit claim only).
+model User {
+  id           String   @id @default(cuid())
+  email        String?  @unique
+  name         String?
+  passwordHash String?  @map("password_hash") // scrypt serialized; null = legacy anonymous row
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  memories    Memory[]
+  entities    Entity[]
+  relations   Relation[]
+  sources     Source[]
+  analyses    MemoryAnalysis[]
+  chats       ChatMessage[]
+  sessions    Session[]
+  resetTokens PasswordResetToken[]
+
+  @@map("users")
+}
+
+// A real authenticated session. The cookie carries a random token;
+// only its SHA-256 hash is stored, so the database alone cannot be
+// used to impersonate anyone. Sessions are created fresh on every
+// login (rotation), expire absolutely, and die with their user.
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique @map("token_hash")
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// A password-reset token. Same hashing rule as sessions. The delivery
+// integration (email) is explicitly deferred — see docs/security.md;
+// the token lifecycle itself is real and tested.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique @map("token_hash")
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// One thing the user chose to keep.
+// originalContent is the user's own words — preserved verbatim, never
+// replaced by a summary or any generated text.
+model Memory {
+  id              String    @id @default(cuid())
+  userId          String    @map("user_id")
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title           String?
+  originalContent String    @map("original_content")
+  summary         String?
+  memoryType      String    @default("note") @map("memory_type")
+  importance      Float     @default(0.5) // 0..1 — a proposal; the user has the final say
+  confidence      Float? // 0..1 — null until real understanding exists
+  status          String    @default("active") // active | archived | superseded
+  rememberedAt    DateTime? @map("remembered_at")
+
+  // ——— Intelligence processing state (Phase 3) ———
+  // Distinct from lifecycle `status`: this tracks whether the system
+  // has finished understanding the memory — never whether the user
+  // wants it. pending → processing → ready | failed. A failed memory
+  // remains saved and retryable; the original content is never lost.
+  processingStatus String    @default("pending") @map("processing_status") // pending | processing | ready | failed
+  processingError  String?   @map("processing_error") // stable, human-safe reason; never raw internals
+  processedAt      DateTime? @map("processed_at")
+  // Semantic embedding lifecycle (Phase 8). The status is honest at
+  // every step: none = never attempted, pending = awaiting generation
+  // (new, stale after an edit, or queued for a model change), ready =
+  // a current-model vector exists and is searchable, deferred =
+  // attempted but this environment has no embedding provider, failed
+  // = attempted and the provider errored (retryable). The memory
+  // remains fully usable in every state.
+  embeddingStatus  String    @default("none") @map("embedding_status") // none | pending | ready | deferred | failed
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  versions       MemoryVersion[]
+  memoryEntities MemoryEntity[]
+  analyses       MemoryAnalysis[]
+  embeddings     MemoryEmbedding[]
+  sources        MemorySource[]
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+  @@index([userId, processingStatus])
+  @@map("memories")
+}
+
+// The persisted semantic embedding of one memory (Phase 8). Stored
+// ONLY by the embedding repository seam, ONLY from a real provider
+// response — there is no code path that fabricates a vector. Vectors
+// from different models/versions are never compared: search filters
+// on the exact (model, version) pair, and a mismatch means the row is
+// stale — regenerable, never silently treated as current.
+model MemoryEmbedding {
+  id         String   @id @default(cuid())
+  memoryId   String   @map("memory_id")
+  memory     Memory   @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+  model      String // embedding model identifier (provider-declared)
+  version    String // embedding-representation version (representation change ⇒ regenerate)
+  dimensions Int
+  status     String   @default("pending") // pending | ready | failed
+  vector     Bytes? // little-endian Float32; null unless status = ready
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([memoryId, model, version])
+  @@index([memoryId])
+  @@map("memory_embeddings")
+}
+
+// Append-only history of a memory's textual state.
+// v1 is written at creation ("created"); each meaningful edit
+// (originalContent, title, or summary) appends the next version
+// ("edited"). Versions are never rewritten or deleted individually —
+// they live and die with their memory.
+model MemoryVersion {
+  id              String   @id @default(cuid())
+  memoryId        String   @map("memory_id")
+  memory          Memory   @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+  versionNumber   Int      @map("version_number")
+  originalContent String   @map("original_content")
+  title           String?
+  summary         String?
+  changeType      String   @map("change_type") // created | edited
+  changeReason    String?  @map("change_reason") // reserved for future AI/user explanations
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@unique([memoryId, versionNumber])
+  @@index([memoryId, versionNumber])
+  @@map("memory_versions")
+}
+
+// Reusable people, places, organizations, projects, topics, objects.
+// Reuse rule: an exact (user, type, canonicalName) match is reused;
+// anything ambiguous is never silently merged (see Rule 4).
+model Entity {
+  id            String   @id @default(cuid())
+  userId        String   @map("user_id")
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type          String // person | place | organization | project | topic | object
+  name          String
+  canonicalName String   @map("canonical_name") // normalized for exact matching
+  description   String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  memoryEntities MemoryEntity[]
+
+  @@unique([userId, type, canonicalName])
+  @@index([userId])
+  @@map("entities")
+}
+
+// Explicit, user-scoped link between a memory and an entity.
+model MemoryEntity {
+  memoryId   String @map("memory_id")
+  memory     Memory @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+  entityId   String @map("entity_id")
+  entity     Entity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  role       String @default("mentioned") // participant | subject | location | topic | mentioned | object
+  confidence Float? // null until real understanding exists
+
+  @@id([memoryId, entityId])
+  @@index([entityId])
+  @@map("memory_entities")
+}
+
+// The graph foundation. Endpoints are polymorphic (memory or entity),
+// so there are no foreign keys here by design — the application layer
+// validates existence and ownership on both ends. No traversal logic
+// exists in Phase 2.
+model Relation {
+  id           String   @id @default(cuid())
+  userId       String   @map("user_id")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceType   String   @map("source_type") // memory | entity
+  sourceId     String   @map("source_id")
+  relationType String   @map("relation_type") // related_to | involves | about | mentions | follows | caused_by | contradicts | replaces | participates_in
+  targetType   String   @map("target_type") // memory | entity
+  targetId     String   @map("target_id")
+  confidence   Float? // null until real understanding exists
+  status       String   @default("active") // active | archived
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([sourceType, sourceId])
+  @@index([targetType, targetId])
+  @@map("relations")
+}
+
+// Intelligence provenance (Phase 3): one row per processing attempt.
+// Stores the VALIDATED analysis/comparison proposals and the decision
+// made by application logic — replaceable, recomputable, and traceable
+// back to the memory and its original source. The raw model output is
+// intentionally NOT stored; only validated proposals survive.
+model MemoryAnalysis {
+  id             String   @id @default(cuid())
+  memoryId       String   @map("memory_id")
+  memory         Memory   @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+  userId         String   @map("user_id")
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  attempt        Int // 1-based, per memory
+  status         String // succeeded | failed | rejected
+  decision       String? // create | update | merge | link | conflict | ignore
+  provider       String // provider id ("zai", "fixture", ...)
+  analysisJson   String?  @map("analysis_json") // validated analysis proposal
+  comparisonJson String?  @map("comparison_json") // validated comparison proposal
+  decisionJson   String?  @map("decision_json") // decision + gates + corroboration + applied changes
+  errorReason    String?  @map("error_reason") // stable, human-safe failure reason
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([memoryId, createdAt])
+  @@index([userId])
+  @@map("memory_analyses")
+}
+
+// Provenance: where a memory came from. Only user_input is actively
+// used in Phase 2; the structure exists so future ingestion sources do
+// not require a redesign.
+model Source {
+  id          String  @id @default(cuid())
+  userId      String  @map("user_id")
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceType  String  @default("user_input") @map("source_type") // user_input | file | image | voice | url | conversation
+  rawContent  String  @map("raw_content")
+  referenceId String? @map("reference_id") // e.g. the memory this source produced
+  metadata    String? // JSON-serialized; Json type on PostgreSQL
+
+  // ——— Extraction state (Phase 9) — distinct from any memory lifecycle. ———
+  // ready = nothing left to extract (typed text, fetched page).
+  // partial = useful text extracted, some enhancement failed.
+  // pending = extractable later (e.g. capability unavailable now).
+  // failed = extraction failed; the original is preserved and retryable.
+  extractionStatus String  @default("ready") @map("extraction_status") // pending | processing | ready | partial | failed
+  extractionError  String? @map("extraction_error") // stable, human-safe; never raw internals
+
+  // Storage seam key for the preserved original (image/audio/file) or
+  // thumbnail — an opaque provider key, never a filesystem path.
+  storageKey String? @map("storage_key")
+
+  // Stable client-supplied request id for idempotent ingestion retries.
+  dedupKey String? @map("dedup_key")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  memorySources MemorySource[]
+
+  @@index([userId])
+  @@index([referenceId])
+  @@index([dedupKey])
+  @@map("sources")
+}
+
+// Provenance join (Phase 9): which sources back which memory. A memory
+// may carry several sources (typed text + screenshot + link), and a
+// source may back more than one memory. The legacy `referenceId` stays
+// in sync for compatibility; the join is authoritative for sharing and
+// safe deletion.
+model MemorySource {
+  memoryId String @map("memory_id")
+  memory   Memory @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+  sourceId String @map("source_id")
+  source   Source @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@id([memoryId, sourceId])
+  @@index([sourceId])
+  @@map("memory_sources")
+}
+
+// The Ask experience's persistence (Phase 4). The user's questions are
+// saved verbatim; assistant records are HONEST CONTEXT NOTES — what was
+// retrieved and why — never invented answers. Full reasoning belongs
+// to Phase 5. Messages live in conversations (server-assigned ids) so
+// follow-up questions can be understood with bounded recent context.
+model ChatMessage {
+  id             String   @id @default(cuid())
+  userId         String   @map("user_id")
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversationId String   @map("conversation_id")
+  role           String // user | assistant
+  content        String
+  // Structured provenance for assistant records (retrieval summary):
+  // JSON-serialized here; Json type on PostgreSQL.
+  contextJson    String?  @map("context_json")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([userId, conversationId, createdAt])
+  @@map("chat_messages")
+}
