@@ -37,6 +37,7 @@ import type {
 import type { UnderstandQueryRequest } from "./query-types";
 import type { GenerateAnswerRequest, VerifyAnswerRequest } from "./reasoning-types";
 import { ZaiIntelligenceProvider } from "./providers/zai";
+import { GeminiIntelligenceProvider } from "./providers/gemini";
 import { DeferredEmbeddingRepository, type EmbeddingRepository } from "./embeddings";
 import { SqliteEmbeddingRepository } from "./sqlite-embeddings";
 
@@ -59,14 +60,18 @@ export {
 } from "./sqlite-embeddings";
 
 /**
- * Provider selection. `AI_PROVIDER` names the provider ("zai" today);
- * when unset, the development default is z.ai. An unknown name fails
- * honestly at call time — never a silent mock.
+ * Provider selection. `AI_PROVIDER` names the provider ("zai" in
+ * development, "gemini" in production); when unset, the development
+ * default is z.ai. An unknown name fails honestly at call time —
+ * never a silent mock.
  */
 function selectProvider(): MemoryIntelligenceProvider {
   const configured = (process.env.AI_PROVIDER ?? "zai").trim().toLowerCase();
   if (configured === "zai") {
     return new ZaiIntelligenceProvider();
+  }
+  if (configured === "gemini") {
+    return new GeminiIntelligenceProvider();
   }
   throw new Error(`The configured AI provider "${configured}" is not available.`);
 }
