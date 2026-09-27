@@ -1,0 +1,130 @@
+# GEMINI LIVE GATE — official test-only CI runner.
+#
+# WHY THIS WORKFLOW EXISTS
+#   The Gemini Developer API rejects requests whose egress IP sits in an
+#   unsupported region (400 FAILED_PRECONDITION "User location is not
+#   supported"). Development sandboxes in such regions can never pass the
+#   live gate — the blocker is the execution environment, not the
+#   application. GitHub-hosted `ubuntu-latest` runners egress from a
+#   supported region, so this workflow executes the EXACT same real
+#   provider code (`src/lib/ai/providers/gemini.ts`) and the EXACT same
+#   gate script (`scripts/live-gate.ts`) from there.
+#
+# WHAT THIS IS NOT
+#   - NOT a deployment. The application is built and served only inside
+#     the ephemeral runner for the E2E job; no user-facing environment is
+#     touched (no Vercel, no production database, no migration).
+#   - NOT a mock run. Both jobs hit the real Google API with the real
+#     key; every step asserts real outcomes and classifies real failures.
+#
+# ONE-TIME SETUP (repository owner)
+#   1. Settings → Secrets and variables → Actions → New repository secret
+#      Name:  GEMINI_API_KEY
+#      Value: the Gemini API key (AI Studio). Never committed anywhere.
+#   2. Actions → "Gemini Live Gate" → Run workflow.
+#
+# SECRET HYGIENE
+#   The key is injected as an environment variable and is never echoed:
+#   the preflight prints only its LENGTH; the gate prints only lengths,
+#   dimensions, norms and fingerprints — never key material, never full
+#   vectors, never user content beyond the fixed fixtures.
+
+name: Gemini Live Gate
+
+on:
+  workflow_dispatch: {} # manual, deliberate — live API spend requires a human
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gemini-live-gate
+  cancel-in-progress: false
+
+jobs:
+  live-gate:
+    name: Live Gate (text · vision · ASR · embeddings · semantic search)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AI_PROVIDER: gemini
+      DATABASE_URL: file:./gate.db
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Gate datasource (ephemeral SQLite — committed production schema untouched)
+        run: |
+          # The committed schema targets PostgreSQL (Supabase). The gate is
+          # self-contained and needs only a throwaway local database, so the
+          # datasource provider is swapped inside this ephemeral workspace.
+          # Nothing outside the runner is modified; no migration runs.
+          sed -i 's/provider *= *"postgresql"/provider = "sqlite"/; /directUrl/d' prisma/schema.prisma
+          bunx prisma generate
+          bunx prisma db push --skip-generate
+
+      - name: Preflight — secret present (length only, never the value)
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::error::GEMINI_API_KEY secret is not set on the repository (Settings → Secrets → Actions)."
+            exit 1
+          fi
+          echo "GEMINI_API_KEY is SET (length ${#GEMINI_API_KEY}) — value never printed."
+
+      - name: LIVE GATE — real requests, no mocks
+        run: bun scripts/live-gate.ts
+
+  production-e2e:
+    name: Production-style E2E (real AI, live expectation)
+    needs: live-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AI_PROVIDER: gemini
+      DATABASE_URL: file:./e2e.db
+      E2E_AI_EXPECTATION: live
+      E2E_BASE: http://localhost:3210
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Ephemeral identity secret (test-only, never printed)
+        run: echo "KEPT_IDENTITY_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: E2E datasource (ephemeral SQLite — committed production schema untouched)
+        run: |
+          sed -i 's/provider *= *"postgresql"/provider = "sqlite"/; /directUrl/d' prisma/schema.prisma
+          bunx prisma generate
+          bunx prisma db push --skip-generate
+
+      - name: Build (production standalone)
+        run: bun run build
+
+      - name: Assemble standalone server
+        run: |
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+
+      - name: Serve and run E2E (real AI path, no mocks)
+        run: |
+          PORT=3210 NODE_ENV=production bun .next/standalone/server.js &
+          for i in $(seq 1 60); do
+            curl -sf "$E2E_BASE/login" > /dev/null && break
+            sleep 2
+          done
+          curl -sf "$E2E_BASE/login" > /dev/null || { echo "::error::standalone server did not become healthy"; exit 1; }
+          bun scripts/e2e-production.mjs
