@@ -23,6 +23,17 @@
 #      Value: the Gemini API key (AI Studio). Never committed anywhere.
 #   2. Actions → "Gemini Live Gate" → Run workflow.
 #
+# V2 RETRY / QUOTA POLICY (implemented in scripts/live-gate.ts)
+#   - 503 UNAVAILABLE → transient: ≤3 attempts, exponential backoff
+#     honoring Google's retryDelay (capped); never a model change;
+#     persistent 503 stays BLOCKED/transient with the attempt count.
+#   - 429 → the real error body is parsed (quota metric, window
+#     RPM/TPM/RPD, scope per-model/per-project, tier): per-minute windows
+#     are retried on Google's own retryDelay; daily/plan exhaustion is
+#     NOT retried (external blocker: quota reset or billing change).
+#   - GATE_SPACING_MS (default 10000) spaces provider-facing requests so
+#     the gate itself never self-induces a rate burst.
+#
 # SECRET HYGIENE
 #   The key is injected as an environment variable and is never echoed:
 #   the preflight prints only its LENGTH; the gate prints only lengths,
@@ -45,10 +56,15 @@ jobs:
   live-gate:
     name: Live Gate (text · vision · ASR · embeddings · semantic search)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # V2 adds retry waits + inter-step spacing; worst case still fits 20 min.
+    timeout-minutes: 20
     env:
       AI_PROVIDER: gemini
-      DATABASE_URL: file:./gate.db
+      # Absolute path: the prisma CLI and the runtime Prisma client resolve
+      # relative SQLite URLs against DIFFERENT bases (schema dir vs client
+      # dir), which silently yields an empty DB. Absolute avoids the split.
+      DATABASE_URL: file:${{ github.workspace }}/gate.db
+      GATE_SPACING_MS: "10000" # documented default; spacing is rate-limit courtesy
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     steps:
       - uses: actions/checkout@v4
@@ -84,11 +100,20 @@ jobs:
   production-e2e:
     name: Production-style E2E (real AI, live expectation)
     needs: live-gate
+    # Run for evidence even when the gate was blocked upstream (quota /
+    # availability): the E2E's expectations stay STRICT — with
+    # E2E_AI_EXPECTATION=live a blocked provider makes it fail honestly,
+    # which is exactly the attribution the report needs.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       AI_PROVIDER: gemini
-      DATABASE_URL: file:./e2e.db
+      # Absolute path (see live-gate job): required here — the E2E serves
+      # the STANDALONE build, whose Prisma client resolves relative SQLite
+      # URLs against .next/standalone/node_modules/.prisma/client, so a
+      # relative URL would point at an empty database (signup would 500).
+      DATABASE_URL: file:${{ github.workspace }}/e2e.db
       E2E_AI_EXPECTATION: live
       E2E_BASE: http://localhost:3210
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
